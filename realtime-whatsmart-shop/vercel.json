@@ -3,7 +3,7 @@
   "routes": [
     {
       "src": "/webhook",
-      "dest": "api/index.py"
+      "dest": "api/webhook.py"
     },
     {
       "src": "/success",

@@ -4,7 +4,6 @@ from flask import Flask, request
 import whisper
 
 app = Flask(__name__)
-r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 
 # --------------------  CONFIG  --------------------
 ACCESS_TOKEN   = os.getenv("ACCESS_TOKEN")
@@ -81,7 +80,13 @@ def refresh_products():
     merged = google + sheet
     return merged
 
-PRODUCTS = refresh_products()
+def get_products():
+    # Lazy load products to avoid runtime at import
+    return refresh_products()
+
+def get_redis():
+    # Lazy load redis to avoid runtime at import
+    return redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 
 # --------------------  INDIA UPI PAYMENT  --------------------
 import stripe
@@ -109,12 +114,15 @@ def create_stripe_checkout(phone, amount):
 # --------------------  CART  --------------------
 def cart_key(phone): return f"cart:{phone}"
 def add_cart(phone, product_id):
+    r = get_redis()
     r.hincrby(cart_key(phone), product_id, 1)
 def show_cart(phone):
+    r = get_redis()
     items = r.hgetall(cart_key(phone))
     if not items:
         send_whatsapp(phone, "text", text="🛒 Cart is empty"); return 0
     total = 0; lines = []
+    PRODUCTS = get_products()
     for pid, qty in items.items():
         p = next(p for p in PRODUCTS if p["id"] == pid.decode())
         sub = int(p["price"]) * int(qty); total += sub
@@ -169,6 +177,7 @@ def hook():
                 phone = msg["from"]
                 # 1. PHOTO -> TRY-ON
                 if msg.get("type") == "image":
+                    PRODUCTS = get_products()
                     prod = [p for p in PRODUCTS if "shoes" in p["name"].lower()][0]
                     media_url = requests.get(f"https://graph.facebook.com/v18.0/{msg['image']['id']}", headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}).json()["url"]
                     overlay = overlay_shoes(media_url, prod["image"])
@@ -186,6 +195,7 @@ def hook():
                     result = whisper.load_model("base").transcribe(voice_file)
                     text = result["text"].lower()
                     # save style pref
+                    r = get_redis()
                     data = json.loads(r.get(f"style:{phone}") or '{"loves":[],"hates":[]}')
                     if "streetwear" in text or "baggy" in text: data["loves"].append("baggy")
                     if "skinny" in text: data["hates"].append("skinny")
@@ -195,6 +205,7 @@ def hook():
                 elif msg.get("type") == "text":
                     txt = msg["text"]["body"].lower()
                     if "shoes" in txt or "search" in txt:
+                        PRODUCTS = get_products()
                         p = PRODUCTS[0]
                         buttons = [{"type": "reply", "reply": {"id": f"add_{p['id']}", "title": "Add to cart"}}]
                         send_whatsapp(phone, "buttons", text=f"{p['name']} ₹{p['price']} (stock {p['stock']})", buttons=buttons)
@@ -222,6 +233,7 @@ def hook():
                             session = stripe.checkout.Session.retrieve(session_id)
                             if session.payment_status == "paid":
                                 send_whatsapp(phone, "text", text=f"✅ Payment successful! Order #{session_id[-6:]} confirmed.")
+                                r = get_redis()
                                 r.delete(cart_key(phone))
                             else:
                                 send_whatsapp(phone, "text", text="⏰ Payment not completed. Tap Pay again or scan QR.")
