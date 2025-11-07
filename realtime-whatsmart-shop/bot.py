@@ -1,9 +1,9 @@
 # bot.py  –  WhatsApp AI shop  –  NO WooCommerce  –  Google-Sheet-as-JSON  –  India UPI
-import os, json, csv, requests, redis, cv2, numpy as np, time, threading
+import os, json, csv, requests, redis, cv2, numpy as np, time, io
 from flask import Flask, request
-import whisper, mediapipe as mp
+import whisper
 
-app = Flask(name)
+app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 
 # --------------------  CONFIG  --------------------
@@ -46,31 +46,6 @@ def send_whatsapp(to, kind="text", text=None, image=None, buttons=None):
             }
         ).sid
 # --------------------  REAL-TIME DATA  --------------------
-# def fetch_shopify():
-#     if not SHOPIFY_TOKEN: return []
-#     q = """{ products(first: 20) {
-#         edges { node {
-#             id title vendor
-#             images(first:1) { edges { node { url } } }
-#             variants(first:1) { edges { node { price quantityAvailable } } }
-#         } }
-#     } }"""
-#     resp = requests.post(f"https://{SHOPIFY_DOMAIN}/api/2023-10/graphql.json",
-#                          json={"query": q},
-#                          headers={"X-Shopify-Storefront-Access-Token": SHOPIFY_TOKEN}).json()
-#     prods = []
-#     for e in resp["data"]["products"]["edges"]:
-#         n = e["node"]
-#         prods.append({
-#             "id": n["id"].split("/")[-1],
-#             "name": n["title"],
-#             "price": float(n["variants"]["edges"][0]["node"]["price"]),
-#             "stock": n["variants"]["edges"][0]["node"]["quantityAvailable"],
-#             "image": n["images"]["edges"][0]["node"]["url"] if n["images"]["edges"] else "",
-#             "vendor": "shopify"
-#         })
-#     return prods
-
 def fetch_google_shopping(query):
     if not GOOGLE_KEY: return []
     url = f"https://www.googleapis.com/customsearch/v1?q={query}&key={GOOGLE_KEY}&cx={GOOGLE_CSE_ID}&num=5"
@@ -95,32 +70,18 @@ def fetch_google_shopping(query):
 def fetch_sheet():
     """Google Sheet → CSV → products (zero keys, 1-min setup)"""
     if not SHEET_CSV: return []
-    r = requests.get(SHEET_CSV)
-    r.encoding = 'utf-8'
-    return list(csv.DictReader(r.text.splitlines()))
+    resp = requests.get(SHEET_CSV)
+    resp.encoding = 'utf-8'
+    return list(csv.DictReader(resp.text.splitlines()))
 
 # --------------------  CACHE  --------------------
-CACHE_FILE = "products.json"
-def load_cache():
-    return json.load(open(CACHE_FILE)) if os.path.exists(CACHE_FILE) else []
-def save_cache(data):
-    json.dump(data, open(CACHE_FILE, "w"), indent=2)
-
 def refresh_products():
-    shopify  = fetch_shopify()
-    google   = fetch_google_shopping("sneakers")
-    sheet    = fetch_sheet()          # ← NEW
-    merged   = shopify + google + sheet
-    save_cache(merged)
+    google = fetch_google_shopping("sneakers")
+    sheet = fetch_sheet()
+    merged = google + sheet
     return merged
 
 PRODUCTS = refresh_products()
-# background refresh every 5 min
-def bg_refresh():
-    while True:
-        time.sleep(300)
-        refresh_products()
-threading.Thread(target=bg_refresh, daemon=True).start()
 
 # --------------------  INDIA UPI PAYMENT  --------------------
 import stripe
@@ -139,8 +100,8 @@ def create_stripe_checkout(phone, amount):
             "quantity": 1
         }],
         mode="payment",
-        success_url="https://your-app.onrender.com/success?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url="https://your-app.onrender.com/cancel",
+        success_url="https://your-app.vercel.app/success?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url="https://your-app.vercel.app/cancel",
         metadata={"phone": phone}
     )
     # 2. Return pay link + QR (same format as before)
@@ -220,8 +181,9 @@ def hook():
                 elif msg.get("type") == "voice":
                     media_url = requests.get(f"https://graph.facebook.com/v18.0/{msg['voice']['id']}", headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}).json()["url"]
                     voice = requests.get(media_url).content
-                    with open("temp.ogg", "wb") as f: f.write(voice)
-                    result = whisper.transcribe("temp.ogg")
+                    # Use a temporary file in memory or avoid file writes for serverless
+                    voice_file = io.BytesIO(voice)
+                    result = whisper.load_model("base").transcribe(voice_file)
                     text = result["text"].lower()
                     # save style pref
                     data = json.loads(r.get(f"style:{phone}") or '{"loves":[],"hates":[]}')
@@ -241,9 +203,9 @@ def hook():
                     elif "checkout" in txt:
                         total = show_cart(phone)
                         if total:
-                            pay = create_upi_order(phone, total)
-                            buttons = [{"type": "reply", "reply": {"id": f"pay_{pay['order_id']}", "title": "💳 Pay now"}}]
-                            send_whatsapp(phone, "buttons", text=f"Total ₹{total}\nTap Pay to open any UPI app.", buttons=buttons)
+                            pay = create_stripe_checkout(phone, total)
+                            buttons = [{"type": "reply", "reply": {"id": f"pay_{pay['session_id']}", "title": "💳 Pay now"}}]
+                            send_whatsapp(phone, "buttons", text=f"Total ₹{total}\nTap Pay to open payment link.", buttons=buttons)
                             send_whatsapp(phone, "image", image=pay["qr"])
                     else:
                         send_whatsapp(phone, "text", text="Menu: search | cart | checkout")
@@ -254,18 +216,18 @@ def hook():
                         add_cart(phone, bid.split("_")[1])
                         send_whatsapp(phone, "text", text="✅ Added to cart")
                     elif bid.startswith("pay_"):
-                        order_id = bid.split("_")[1]
-                        paid = False
-                        for _ in range(6):
-                            if check_payment(order_id):
-                                paid = True; break
-                            time.sleep(5)
-                        if paid:
-                            send_whatsapp(phone, "text", text=f"✅ Payment successful! Order #{order_id[-6:]} confirmed.")
-                            r.delete(cart_key(phone))
-                        else:
-                            send_whatsapp(phone, "text", text="⏰ Payment not completed. Tap Pay again or scan QR.")
+                        session_id = bid.split("_")[1]
+                        # Check payment status using Stripe
+                        try:
+                            session = stripe.checkout.Session.retrieve(session_id)
+                            if session.payment_status == "paid":
+                                send_whatsapp(phone, "text", text=f"✅ Payment successful! Order #{session_id[-6:]} confirmed.")
+                                r.delete(cart_key(phone))
+                            else:
+                                send_whatsapp(phone, "text", text="⏰ Payment not completed. Tap Pay again or scan QR.")
+                        except Exception as e:
+                            send_whatsapp(phone, "text", text="Error checking payment. Please try again.")
     return "OK"
 
-if name == "main":
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
